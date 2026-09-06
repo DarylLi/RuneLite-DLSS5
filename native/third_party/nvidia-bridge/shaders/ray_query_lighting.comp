@@ -1,0 +1,348 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelScene;
+layout(rgba16f, set = 0, binding = 1) uniform image2D hdrColor;
+layout(set = 0, binding = 2) uniform sampler2D sceneDepth;
+layout(std430, set = 0, binding = 3) readonly buffer StaticLights {
+    // Four vec4 records per light: position/range, direction/outer cone,
+    // linear color/intensity, inner cone/type/decay.
+    vec4 staticLightRecords[];
+};
+
+layout(set = 0, binding = 4) uniform sampler2D materialGuide;
+
+// Profile lighting-v1. Every ray/sampling policy value is supplied by the
+// caller; the native bridge only packs this fixed 128-byte ABI.
+layout(push_constant) uniform FrameConstants {
+    mat4 inverseViewProjection;
+    // xyz camera position, w directional-light maximum ray distance.
+    vec4 cameraPositionMaximumDistance;
+    // xyz direction from the surface toward the light, w angular radius.
+    vec4 directionalLightDirectionAngularRadius;
+    // x directional visibility strength, y ambient floor, z direct coefficient,
+    // w ray-origin bias.
+    vec4 lightingParameters;
+    // xy full render-target extent; z packs viewport x/y and w packs viewport
+    // width/height as two unsigned 16-bit values each.
+    uvec4 extentFlags;
+} frame;
+
+// Ray queries stay at quarter linear resolution, but the result is no longer
+// stamped as a binary 4x4 square. Each 8x8 workgroup computes a 7x7 set of
+// output blocks plus a right/bottom halo, then depth-aware bilinear upsampling
+// applies the lighting to the original full-resolution HDR pixels. The halo
+// makes filtering continuous across workgroup boundaries without increasing
+// the dispatch to one ray per pixel.
+const int kLightingBlockSize = 4;
+const int kSharedBlockCount = 8;
+const int kOutputBlockCount = 7;
+
+shared float sharedVisibility[kSharedBlockCount][kSharedBlockCount];
+shared float sharedDepth[kSharedBlockCount][kSharedBlockCount];
+shared vec3 sharedWorld[kSharedBlockCount][kSharedBlockCount];
+shared vec3 sharedNormal[kSharedBlockCount][kSharedBlockCount];
+shared vec4 sharedLocalLighting[kSharedBlockCount][kSharedBlockCount];
+
+ivec2 viewportOrigin() {
+    return ivec2(frame.extentFlags.z & 0xffffu,
+                 frame.extentFlags.z >> 16u);
+}
+
+ivec2 viewportExtent() {
+    return ivec2(frame.extentFlags.w & 0xffffu,
+                 frame.extentFlags.w >> 16u);
+}
+
+ivec2 clampToViewport(ivec2 pixel) {
+    ivec2 minimumPixel = viewportOrigin();
+    ivec2 maximumPixel = minimumPixel + viewportExtent() - ivec2(1);
+    return clamp(pixel, minimumPixel, maximumPixel);
+}
+
+float readDepth(ivec2 pixel) {
+    pixel = clampToViewport(pixel);
+    return texelFetch(sceneDepth, pixel, 0).r;
+}
+
+bool isBackground(float depth) {
+    // RuneLite's scene pass always uses reverse depth and clears it to zero.
+    return depth <= 1e-6;
+}
+
+vec3 reconstructWorld(ivec2 pixel, float depth) {
+    pixel = clampToViewport(pixel);
+    vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(frame.extentFlags.xy);
+    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    vec4 world = frame.inverseViewProjection * clip;
+    return world.xyz / max(abs(world.w), 1e-8);
+}
+
+bool sameSurfaceDelta(
+    ivec2 pixel, float centerDepth, vec3 centerWorld, ivec2 axis, out vec3 delta) {
+    ivec2 minimumPixel = viewportOrigin();
+    ivec2 endPixel = minimumPixel + viewportExtent();
+    float bestDistance = 3.402823e38;
+    bool found = false;
+    delta = vec3(0.0);
+    for (int direction = -1; direction <= 1; direction += 2) {
+        ivec2 candidate = pixel + axis * direction;
+        if (any(lessThan(candidate, minimumPixel)) ||
+            any(greaterThanEqual(candidate, endPixel))) continue;
+        float candidateDepth = texelFetch(sceneDepth, candidate, 0).r;
+        if (isBackground(candidateDepth)) continue;
+        // Reject the opposite side of a silhouette instead of reconstructing a
+        // normal from an unrelated surface (or the far-plane clear value).
+        float relativeDepthDifference = abs(candidateDepth - centerDepth) /
+            max(max(candidateDepth, centerDepth), 1e-5);
+        if (relativeDepthDifference > 0.08) continue;
+        vec3 candidateDelta = reconstructWorld(candidate, candidateDepth) - centerWorld;
+        float candidateDistance = dot(candidateDelta, candidateDelta);
+        if (candidateDistance > 1e-8 && candidateDistance < bestDistance) {
+            bestDistance = candidateDistance;
+            delta = candidateDelta;
+            found = true;
+        }
+    }
+    return found;
+}
+
+bool occluded(vec3 origin, vec3 direction, float maximumDistance) {
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, topLevelScene,
+        gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+        0xffu, origin, 0.0, direction, maximumDistance);
+    while (rayQueryProceedEXT(query)) {}
+    return rayQueryGetIntersectionTypeEXT(query, true) !=
+           gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+uint hash(uint value) {
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    return value ^ (value >> 16u);
+}
+
+float random01(inout uint state) {
+    state = hash(state);
+    return float(state & 0x00ffffffu) / float(0x01000000u);
+}
+
+vec3 cosineHemisphere(vec3 normal, inout uint state) {
+    float u1 = random01(state);
+    float u2 = random01(state);
+    float radius = sqrt(u1);
+    float angle = 6.28318530718 * u2;
+    vec3 tangent = normalize(abs(normal.z) < 0.999
+        ? cross(normal, vec3(0.0, 0.0, 1.0))
+        : cross(normal, vec3(0.0, 1.0, 0.0)));
+    vec3 bitangent = cross(normal, tangent);
+    return normalize(tangent * (radius * cos(angle)) +
+                     bitangent * (radius * sin(angle)) +
+                     normal * sqrt(max(0.0, 1.0 - u1)));
+}
+
+void main() {
+    ivec2 minimumPixel = viewportOrigin();
+    ivec2 endPixel = minimumPixel + viewportExtent();
+    ivec2 localBlock = ivec2(gl_LocalInvocationID.xy);
+    ivec2 blockIndex = ivec2(gl_WorkGroupID.xy) * kOutputBlockCount + localBlock;
+    ivec2 blockPixel = minimumPixel + blockIndex * kLightingBlockSize;
+    bool blockInBounds = all(lessThan(blockPixel, endPixel));
+
+    // Sample the grid origin, then fall back to the first covered geometry
+    // pixel. This prevents a background sample at silhouettes from skipping
+    // neighbouring visible pixels in the same coarse block.
+    ivec2 samplePixel = min(
+        blockPixel, endPixel - ivec2(1));
+    float depth = blockInBounds ? readDepth(samplePixel) : 0.0;
+    bool foundGeometry = blockInBounds && !isBackground(depth);
+    for (int blockY = 0; blockY < kLightingBlockSize && !foundGeometry; ++blockY) {
+        for (int blockX = 0; blockX < kLightingBlockSize && !foundGeometry; ++blockX) {
+            ivec2 candidate = blockPixel + ivec2(blockX, blockY);
+            if (any(greaterThanEqual(candidate, endPixel))) continue;
+            float candidateDepth = readDepth(candidate);
+            if (!isBackground(candidateDepth)) {
+                samplePixel = candidate;
+                depth = candidateDepth;
+                foundGeometry = true;
+            }
+        }
+    }
+    float directionalFactor = 1.0;
+    vec3 world = vec3(0.0);
+    vec3 normal = vec3(0.0, -1.0, 0.0);
+    vec3 localIrradiance = vec3(0.0);
+    if (foundGeometry) {
+        world = reconstructWorld(samplePixel, depth);
+        vec3 deltaX;
+        vec3 deltaY;
+        bool hasDeltaX = sameSurfaceDelta(
+            samplePixel, depth, world, ivec2(1, 0), deltaX);
+        bool hasDeltaY = sameSurfaceDelta(
+            samplePixel, depth, world, ivec2(0, 1), deltaY);
+        normal = hasDeltaX && hasDeltaY
+            ? normalize(cross(deltaY, deltaX))
+            : vec3(0.0, -1.0, 0.0);
+        vec3 toCamera = normalize(frame.cameraPositionMaximumDistance.xyz - world);
+        if (any(isnan(normal)) || any(isinf(normal))) normal = vec3(0.0, -1.0, 0.0);
+        if (dot(normal, toCamera) < 0.0) normal = -normal;
+
+        float rayBias = max(frame.lightingParameters.w, max(max(abs(world.x), abs(world.y)), abs(world.z)) * 2e-6);
+        vec3 origin = world + normal * rayBias;
+        vec3 directionalRay =
+            normalize(frame.directionalLightDirectionAngularRadius.xyz);
+
+
+        // A one-sample area light and a one-sample random AO ray made every
+        // coarse block choose a different binary result. That screen-space
+        // noise was then multiplied into the entire scene. Use a deterministic
+        // centre sun ray and leave ambient occlusion to the raster material
+        // pass until a temporally accumulated AO buffer exists.
+        float directionalVisibility = frame.lightingParameters.z > 0.0 && occluded(
+            origin, directionalRay, frame.cameraPositionMaximumDistance.w)
+            ? 0.0
+            : 1.0;
+        directionalFactor = mix(
+            1.0, directionalVisibility,
+            clamp(frame.lightingParameters.x, 0.0, 1.0));
+
+        uint lightCount = min(uint(staticLightRecords.length()) / 4u, 8u);
+        for (uint lightIndex = 0u; lightIndex < lightCount; ++lightIndex) {
+            uint first = lightIndex * 4u;
+            vec4 positionRange = staticLightRecords[first + 0u];
+            vec4 directionOuter = staticLightRecords[first + 1u];
+            vec4 colorIntensity = staticLightRecords[first + 2u];
+            vec4 coneTypeDecay = staticLightRecords[first + 3u];
+            if (colorIntensity.a <= 0.0 || positionRange.w <= 0.0) continue;
+            vec3 toLight = positionRange.xyz - world;
+            float distanceToLight = length(toLight);
+            if (distanceToLight <= rayBias || distanceToLight >= positionRange.w) continue;
+            vec3 lightDirection = toLight / distanceToLight;
+            float normalDotLight = max(dot(normal, lightDirection), 0.0);
+            if (normalDotLight <= 0.0) continue;
+
+            float cone = 1.0;
+            if (int(round(coneTypeDecay.y)) == 1) {
+                float directionLength = length(directionOuter.xyz);
+                if (directionLength <= 1e-6) continue;
+                vec3 emittedDirection = directionOuter.xyz / directionLength;
+                float angleCos = dot(emittedDirection, -lightDirection);
+                float outerCos = clamp(directionOuter.w, -1.0, 1.0);
+                float innerCos = clamp(coneTypeDecay.x, outerCos, 1.0);
+                cone = smoothstep(
+                    outerCos, max(innerCos, outerCos + 1e-5), angleCos);
+                if (cone <= 1e-5) continue;
+            }
+
+            vec3 shadowOrigin = world + normal * rayBias;
+            vec3 shadowVector = positionRange.xyz - shadowOrigin;
+            float shadowDistance = length(shadowVector);
+            if (shadowDistance <= rayBias ||
+                occluded(shadowOrigin, shadowVector / shadowDistance,
+                         max(rayBias, shadowDistance - rayBias))) continue;
+            float normalizedDistance = clamp(
+                distanceToLight / positionRange.w, 0.0, 1.0);
+            float attenuation = 1.0 - normalizedDistance;
+            attenuation *= attenuation;
+            float decay = max(coneTypeDecay.z, 0.0);
+            attenuation /= max(
+                pow(max(distanceToLight, 1.0), decay), 1e-4);
+            localIrradiance += max(colorIntensity.rgb, vec3(0.0)) *
+                colorIntensity.a * attenuation * cone * normalDotLight;
+        }
+    }
+
+    sharedVisibility[localBlock.y][localBlock.x] = directionalFactor;
+    sharedDepth[localBlock.y][localBlock.x] = foundGeometry ? depth : 0.0;
+    sharedWorld[localBlock.y][localBlock.x] = world;
+    sharedNormal[localBlock.y][localBlock.x] = normal;
+    sharedLocalLighting[localBlock.y][localBlock.x] =
+        vec4(localIrradiance, foundGeometry ? 1.0 : 0.0);
+    barrier();
+
+    // The eighth row and column are a filter halo. The 7x7 output ownership
+    // keeps image writes disjoint while making each workgroup's right/bottom
+    // neighbour available for bilinear reconstruction.
+    if (any(greaterThanEqual(localBlock, ivec2(kOutputBlockCount))) ||
+        !blockInBounds) return;
+
+    for (int blockY = 0; blockY < kLightingBlockSize; ++blockY) {
+        for (int blockX = 0; blockX < kLightingBlockSize; ++blockX) {
+            ivec2 targetPixel = blockPixel + ivec2(blockX, blockY);
+            if (any(greaterThanEqual(targetPixel, endPixel))) continue;
+            float targetDepth = readDepth(targetPixel);
+            if (isBackground(targetDepth)) continue;
+
+            vec3 targetWorld = reconstructWorld(targetPixel, targetDepth);
+            vec2 fractional = vec2(blockX, blockY) /
+                float(kLightingBlockSize);
+            float visibilitySum = 0.0;
+
+            vec3 localLightingSum = vec3(0.0);
+            float weightSum = 0.0;
+            for (int neighbourY = 0; neighbourY <= 1; ++neighbourY) {
+                for (int neighbourX = 0; neighbourX <= 1; ++neighbourX) {
+                    ivec2 neighbour = localBlock + ivec2(neighbourX, neighbourY);
+                    float neighbourDepth = sharedDepth[neighbour.y][neighbour.x];
+                    if (isBackground(neighbourDepth) ||
+                        sharedLocalLighting[neighbour.y][neighbour.x].a < 0.5)
+                        continue;
+                    float relativeDepthDifference =
+                        abs(neighbourDepth - targetDepth) /
+                        max(max(neighbourDepth, targetDepth), 1e-5);
+                    if (relativeDepthDifference > 0.08) continue;
+                    // Depth alone accepts parallel but separate floors/walls.
+                    // Compare distance to the sampled receiver plane as well.
+                    vec3 separation = targetWorld - sharedWorld[neighbour.y][neighbour.x];
+                    float planeDistance = abs(dot(separation, sharedNormal[neighbour.y][neighbour.x]));
+                    if (planeDistance > max(frame.lightingParameters.w * 2.0, length(separation) * 0.02)) continue;
+                    float weightX = neighbourX == 0
+                        ? 1.0 - fractional.x
+                        : fractional.x;
+                    float weightY = neighbourY == 0
+                        ? 1.0 - fractional.y
+                        : fractional.y;
+                    float weight = weightX * weightY;
+                    visibilitySum +=
+                        sharedVisibility[neighbour.y][neighbour.x] * weight;
+
+                    localLightingSum +=
+                        sharedLocalLighting[neighbour.y][neighbour.x].rgb * weight;
+                    weightSum += weight;
+                }
+            }
+            float filteredVisibility = weightSum > 1e-5
+                ? visibilitySum / weightSum
+                : 1.0;
+            vec3 filteredLocalLighting = weightSum > 1e-5
+                ? localLightingSum / weightSum
+                : vec3(0.0);
+            // Isolated silhouettes must trace their own receiver instead of
+            // becoming fully lit simply because all coarse neighbours differ.
+            if (weightSum <= 1e-5 && frame.lightingParameters.z > 0.0) {
+                vec3 dx, dy;
+                bool validX = sameSurfaceDelta(targetPixel, targetDepth, targetWorld, ivec2(1, 0), dx);
+                bool validY = sameSurfaceDelta(targetPixel, targetDepth, targetWorld, ivec2(0, 1), dy);
+                vec3 n = validX && validY ? cross(dy, dx) : vec3(0.0, -1.0, 0.0);
+                n = dot(n, n) > 1e-12 ? normalize(n) : vec3(0.0, -1.0, 0.0);
+                if (dot(n, frame.cameraPositionMaximumDistance.xyz - targetWorld) < 0.0) n = -n;
+                float bias = max(frame.lightingParameters.w,
+                    max(max(abs(targetWorld.x), abs(targetWorld.y)), abs(targetWorld.z)) * 2e-6);
+                bool blocked = occluded(targetWorld + n * bias,
+                    normalize(frame.directionalLightDirectionAngularRadius.xyz),
+                    frame.cameraPositionMaximumDistance.w);
+                filteredVisibility = 1.0 - (blocked ? clamp(frame.lightingParameters.x, 0.0, 1.0) : 0.0);
+            }
+            vec4 color = imageLoad(hdrColor, targetPixel);
+            float sunlightFraction = texelFetch(materialGuide, targetPixel, 0).a;
+            color.rgb *= 1.0 - sunlightFraction * (1.0 - filteredVisibility);
+            color.rgb += texelFetch(materialGuide, targetPixel, 0).rgb * filteredLocalLighting * 0.31830988618;
+            imageStore(hdrColor, targetPixel, color);
+        }
+    }
+}
